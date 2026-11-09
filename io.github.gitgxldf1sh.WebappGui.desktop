@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Web Apps
+Name[es]=Webapps
+GenericName=Web App Manager
+GenericName[es]=Gestor de webapps
+Comment=Turn websites into desktop apps
+Comment[es]=Convierte webs en aplicaciones de escritorio
+Exec=webapp-gui
+Icon=web-browser
+Terminal=false
+Categories=Utility;
+Keywords=webapp;web;app;pwa;
+Keywords[es]=webapp;web;app;pwa;aplicación;
+StartupWMClass=io.github.gitgxldf1sh.WebappGui

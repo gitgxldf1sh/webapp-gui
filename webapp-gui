@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""webapp-gui — turn websites into desktop apps (.desktop launchers).
+
+Usage:
+  webapp-gui                              open the graphical interface
+  webapp-gui list                         list the web apps
+  webapp-gui add NAME URL [-b BROWSER] [-i ICON] [-f]
+  webapp-gui remove NAME
+
+Each web app is stored in ~/.local/share/applications/webapp-<slug>.desktop
+and can be launched with:  gtk-launch webapp-<slug>
+
+The interface follows the system language (English and Spanish for now).
+"""
+import argparse
+import configparser
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+APPS_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "applications"
+ICON_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "icons/webapps"
+PREFIX = "webapp-"
+FALLBACK_ICON = "web-browser"
+
+
+# ───────────────────────── idioma ─────────────────────────
+# Se usa el idioma del sistema (LANGUAGE, LC_ALL, LC_MESSAGES, LANG).
+# Los textos del código están en inglés; aquí van las traducciones.
+# Para añadir un idioma, crea otro diccionario y regístralo en TRANSLATIONS.
+
+ES = {
+    "The name is not valid.": "El nombre no es válido.",
+    "The URL is not valid.": "La URL no es válida.",
+    "A web app named “{}” already exists.": "Ya existe una webapp llamada «{}».",
+    "Web app for {}": "Webapp de {}",
+    "Manage web apps (.desktop launchers)": "Gestiona webapps (lanzadores .desktop)",
+    "list the web apps": "lista las webapps",
+    "add a web app": "añade una webapp",
+    "path to an image, or an icon theme name": "ruta a una imagen o nombre de icono del tema",
+    "overwrite if it already exists": "sobrescribir si ya existe",
+    "remove a web app": "elimina una webapp",
+    "No web apps yet.": "No hay webapps.",
+    "Error: {}": "Error: {}",
+    "Created: {}": "Creada: {}",
+    "Launch it with: {}": "Lánzala con: {}",
+    "Removed: {}": "Eliminada: {}",
+    "{} does not exist": "No existe {}",
+    "Edit web app": "Editar webapp",
+    "New web app": "Nueva webapp",
+    "Cancel": "Cancelar",
+    "Save": "Guardar",
+    "Add": "Añadir",
+    "Name": "Nombre",
+    "Browser": "Navegador",
+    "Icon": "Icono",
+    "Automatic (favicon)": "Automático (favicon)",
+    "Choose a file": "Elegir archivo",
+    "Fetch the favicon again": "Volver a descargar el favicon",
+    "Current": "Actual",
+    "Command: {}": "Atajo: {}",
+    "Choose an icon": "Elegir icono",
+    "Images": "Imágenes",
+    "Saving…": "Guardando…",
+    "“{}” saved": "«{}» guardada",
+    "Web Apps": "Webapps",
+    "New web app (Ctrl+N)": "Nueva webapp (Ctrl+N)",
+    "Search…": "Buscar…",
+    "No web apps": "Sin webapps",
+    "Press + to add the first one.": "Pulsa + para añadir la primera.",
+    "1 web app": "1 webapp",
+    "{} web apps": "{} webapps",
+    "Open without closing": "Abrir sin cerrar",
+    "Edit": "Editar",
+    "Delete": "Eliminar",
+    "More options": "Más opciones",
+    "Delete “{}”?": "¿Eliminar «{}»?",
+    "{} and its icon will be deleted.": "Se borrará {} y su icono.",
+    "“{}” deleted": "«{}» eliminada",
+}
+
+TRANSLATIONS = {"es": ES}
+
+
+def _system_language() -> str:
+    for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+        val = os.environ.get(var, "")
+        for code in val.split(":"):
+            code = code.split(".")[0].split("_")[0].lower()
+            if code and code not in ("c", "posix"):
+                return code
+    return "en"
+
+
+_STRINGS = TRANSLATIONS.get(_system_language(), {})
+
+
+def _(text: str) -> str:
+    return _STRINGS.get(text, text)
+
+# Orden de preferencia: el primero instalado es el predeterminado.
+# Solo navegadores basados en Chromium: son los únicos con modo --app.
+KNOWN_BROWSERS = [
+    "brave-origin-nightly",
+    "helium-browser",
+    "google-chrome-stable",
+    "google-chrome",
+    "chromium",
+    "brave",
+    "brave-browser",
+    "vivaldi-stable",
+    "vivaldi",
+    "microsoft-edge-stable",
+    "thorium-browser",
+]
+
+
+# ───────────────────────── núcleo ─────────────────────────
+
+def available_browsers():
+    return [b for b in KNOWN_BROWSERS if shutil.which(b)] or ["xdg-open"]
+
+
+def slugify(name: str) -> str:
+    s = name.strip().lower()
+    s = re.sub(r"[áàä]", "a", s); s = re.sub(r"[éèë]", "e", s)
+    s = re.sub(r"[íìï]", "i", s); s = re.sub(r"[óòö]", "o", s)
+    s = re.sub(r"[úùü]", "u", s); s = s.replace("ñ", "n")
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s
+
+
+def normalize_url(url: str) -> str:
+    url = url.strip()
+    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "https://" + url
+    return url
+
+
+def desktop_path(slug: str) -> Path:
+    return APPS_DIR / f"{PREFIX}{slug}.desktop"
+
+
+def _exec_quote(arg: str) -> str:
+    """Cita un argumento según la spec Desktop Entry (y escapa % como %%)."""
+    arg = arg.replace("%", "%%")
+    if re.search(r'[\s"\'\\><~|&;$*?#()`]', arg):
+        arg = '"' + re.sub(r'(["`$\\])', r"\\\1", arg) + '"'
+    return arg
+
+
+def build_exec(browser: str, url: str, slug: str) -> str:
+    if browser == "xdg-open":
+        return f"xdg-open {_exec_quote(url)}"
+    args = [browser, f"--app={url}", f"--class={PREFIX}{slug}", f"--name={PREFIX}{slug}"]
+    return " ".join(_exec_quote(a) for a in args)
+
+
+def list_webapps():
+    apps = []
+    if not APPS_DIR.is_dir():
+        return apps
+    for f in sorted(APPS_DIR.glob(f"{PREFIX}*.desktop")):
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.optionxform = str
+        try:
+            cp.read(f, encoding="utf-8")
+            e = cp["Desktop Entry"]
+        except Exception:
+            continue
+        url = e.get("X-WebApp-URL", "")
+        browser = e.get("X-WebApp-Browser", "")
+        if not url:  # .desktop antiguo: intentar sacar la URL del Exec
+            m = re.search(r"--app=\"?([^\"\s]+)", e.get("Exec", ""))
+            url = m.group(1).replace("%%", "%") if m else ""
+        if not browser:
+            browser = e.get("Exec", "").split(" ")[0].strip('"')
+        apps.append({
+            "slug": f.stem[len(PREFIX):],
+            "name": e.get("Name", f.stem),
+            "url": url,
+            "browser": browser,
+            "icon": e.get("Icon", FALLBACK_ICON),
+            "path": f,
+        })
+    return sorted(apps, key=lambda a: a["name"].lower())
+
+
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+
+
+def _http_get(url: str, limit=2_000_000):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return r.read(limit), r.headers.get_content_type(), r.geturl()
+
+
+def _page_icon_links(url: str):
+    """Extrae <link rel=icon|apple-touch-icon> del HTML, mayores primero."""
+    try:
+        html, ctype, final = _http_get(url, 500_000)
+    except Exception:
+        return []
+    if "html" not in ctype:
+        return []
+    html = html.decode("utf-8", "ignore")
+    found = []
+    for tag in re.findall(r"<link\b[^>]*>", html, re.I):
+        rel = re.search(r'rel=["\']?([^"\'>]+)', tag, re.I)
+        href = re.search(r'href=["\']?([^"\'\s>]+)', tag, re.I)
+        if not rel or not href or "icon" not in rel.group(1).lower():
+            continue
+        if "mask-icon" in rel.group(1).lower():
+            continue
+        sizes = re.search(r'sizes=["\']?(\d+)', tag, re.I)
+        size = int(sizes.group(1)) if sizes else (180 if "apple" in rel.group(1) else 32)
+        if href.group(1).lower().endswith(".svg"):
+            size = 512
+        found.append((size, urllib.parse.urljoin(final, href.group(1))))
+    return [u for _, u in sorted(found, reverse=True)]
+
+
+def _to_png(src: Path, dest: Path) -> bool:
+    """Convierte a PNG 128px eligiendo el fotograma más grande (para .ico)."""
+    if not shutil.which("magick"):
+        src.replace(dest)
+        return True
+    try:
+        out = subprocess.run(["magick", "identify", "-format", "%w\n", str(src)],
+                             check=True, capture_output=True, text=True).stdout.split()
+        widths = [int(w) for w in out]
+        if not widths or max(widths) < 16:
+            return False
+        frame = widths.index(max(widths))
+        subprocess.run(["magick", "-background", "none", "-density", "384",
+                        f"{src}[{frame}]", "-resize", "128x128", f"PNG32:{dest}"],
+                       check=True, capture_output=True)
+        return True
+    except Exception:
+        return False
+    finally:
+        src.unlink(missing_ok=True)
+
+
+def fetch_favicon(url: str, slug: str):
+    """Descarga el mejor icono disponible y devuelve la ruta, o None si falla."""
+    host = urllib.parse.urlparse(url).hostname
+    if not host:
+        return None
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+    dest = ICON_DIR / f"{PREFIX}{slug}.png"
+    base = ".".join(host.split(".")[-2:])  # mail.proton.me -> proton.me
+    hosts = [host] + ([base] if base != host else [])
+    sources = [f"https://{host}/apple-touch-icon.png"]
+    sources += _page_icon_links(url)
+    sources += [f"https://www.google.com/s2/favicons?domain={h}&sz=128" for h in hosts]
+    sources += [f"https://icons.duckduckgo.com/ip3/{h}.ico" for h in hosts]
+    sources += [f"https://{host}/favicon.ico"]
+    for src in sources:
+        try:
+            data, ctype, _ = _http_get(src)
+        except Exception:
+            continue  # 404 y demás errores HTTP
+        if len(data) < 100 or ctype.startswith("text/"):
+            continue
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        if _to_png(tmp, dest):
+            return str(dest)
+    return None
+
+
+def import_icon(src: str, slug: str):
+    """Copia un icono local elegido por el usuario al directorio de iconos."""
+    srcp = Path(src).expanduser()
+    if not srcp.is_file():
+        return src  # quizá es un nombre de tema de iconos
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+    dest = ICON_DIR / f"{PREFIX}{slug}{srcp.suffix.lower() or '.png'}"
+    if srcp.resolve() != dest.resolve():
+        for old in ICON_DIR.glob(f"{PREFIX}{slug}.*"):
+            old.unlink(missing_ok=True)
+        shutil.copyfile(srcp, dest)
+    return str(dest)
+
+
+def write_webapp(name: str, url: str, browser: str, icon: str | None = None,
+                 old_slug: str | None = None, fetch_icon: bool = True) -> Path:
+    name = name.strip()
+    slug = slugify(name)
+    if not slug:
+        raise ValueError(_("The name is not valid."))
+    url = normalize_url(url)
+    if not urllib.parse.urlparse(url).netloc:
+        raise ValueError(_("The URL is not valid."))
+    if old_slug != slug and desktop_path(slug).exists():
+        raise ValueError(_("A web app named “{}” already exists.").format(slug))
+
+    if icon:
+        icon = import_icon(icon, slug)
+    elif fetch_icon:
+        icon = fetch_favicon(url, slug)
+    icon = icon or FALLBACK_ICON
+
+    APPS_DIR.mkdir(parents=True, exist_ok=True)
+    content = (
+        "[Desktop Entry]\n"
+        "Version=1.0\n"
+        "Type=Application\n"
+        f"Name={name}\n"
+        "Comment=" + _("Web app for {}").format(urllib.parse.urlparse(url).netloc) + "\n"
+        f"Exec={build_exec(browser, url, slug)}\n"
+        f"Icon={icon}\n"
+        "Terminal=false\n"
+        "Categories=Network;WebBrowser;\n"
+        f"StartupWMClass={PREFIX}{slug}\n"
+        f"X-WebApp-URL={url}\n"
+        f"X-WebApp-Browser={browser}\n"
+    )
+    path = desktop_path(slug)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.chmod(0o755)
+    tmp.replace(path)
+
+    if old_slug and old_slug != slug:
+        remove_webapp(old_slug, keep_icon_path=icon)
+    _refresh_db()
+    return path
+
+
+def remove_webapp(slug: str, keep_icon_path: str | None = None) -> bool:
+    path = desktop_path(slug)
+    existed = path.exists()
+    path.unlink(missing_ok=True)
+    for ic in ICON_DIR.glob(f"{PREFIX}{slug}.*"):
+        if str(ic) != keep_icon_path:
+            ic.unlink(missing_ok=True)
+    _refresh_db()
+    return existed
+
+
+def launch_webapp(slug: str):
+    subprocess.Popen(["gtk-launch", f"{PREFIX}{slug}"], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _refresh_db():
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", str(APPS_DIR)], capture_output=True)
+
+
+# ───────────────────────── CLI ─────────────────────────
+
+def cli(argv):
+    p = argparse.ArgumentParser(prog="webapp-gui", description=_("Manage web apps (.desktop launchers)"))
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("list", help=_("list the web apps"))
+    a = sub.add_parser("add", help=_("add a web app"))
+    a.add_argument("name"); a.add_argument("url")
+    a.add_argument("-b", "--browser", default=available_browsers()[0])
+    a.add_argument("-i", "--icon", help=_("path to an image, or an icon theme name"))
+    a.add_argument("-f", "--force", action="store_true", help=_("overwrite if it already exists"))
+    r = sub.add_parser("remove", aliases=["rm"], help=_("remove a web app"))
+    r.add_argument("name")
+    args = p.parse_args(argv)
+
+    if args.cmd == "list":
+        apps = list_webapps()
+        if not apps:
+            print(_("No web apps yet."))
+        for ap in apps:
+            print(f"{PREFIX}{ap['slug']:<22} {ap['url']:<45} [{ap['browser']}]")
+    elif args.cmd == "add":
+        slug = slugify(args.name)
+        try:
+            path = write_webapp(args.name, args.url, args.browser, args.icon,
+                                old_slug=slug if args.force else None)
+        except ValueError as e:
+            sys.exit(_("Error: {}").format(e))
+        print(_("Created: {}").format(path))
+        print(_("Launch it with: {}").format(f"gtk-launch {PREFIX}{slug}"))
+    elif args.cmd in ("remove", "rm"):
+        slug = slugify(args.name.removeprefix(PREFIX))
+        if remove_webapp(slug):
+            print(_("Removed: {}").format(PREFIX + slug))
+        else:
+            sys.exit(_("{} does not exist").format(PREFIX + slug))
+    else:
+        p.print_help()
+
+
+# ───────────────────────── GUI ─────────────────────────
+
+def gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gio, GLib, Gtk
+
+    def make_icon(icon: str, size=32):
+        img = Gtk.Image(pixel_size=size)
+        if icon and os.path.isabs(icon) and os.path.exists(icon):
+            img.set_from_file(icon)
+        else:
+            img.set_from_icon_name(icon or FALLBACK_ICON)
+        return img
+
+    class EditDialog(Adw.Dialog):
+        def __init__(self, win, app_data=None):
+            super().__init__(title=_("Edit web app") if app_data else _("New web app"),
+                             content_width=460)
+            self.win = win
+            self.old = app_data
+            self.icon_path = None
+
+            tv = Adw.ToolbarView()
+            hb = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+            cancel = Gtk.Button(label=_("Cancel"))
+            cancel.connect("clicked", lambda *_: self.close())
+            self.save_btn = Gtk.Button(label=_("Save") if app_data else _("Add"),
+                                       css_classes=["suggested-action"])
+            self.save_btn.connect("clicked", self.on_save)
+            hb.pack_start(cancel); hb.pack_end(self.save_btn)
+            tv.add_top_bar(hb)
+
+            page = Adw.PreferencesPage()
+            grp = Adw.PreferencesGroup()
+            self.name = Adw.EntryRow(title=_("Name"))
+            self.url = Adw.EntryRow(title="URL", input_purpose=Gtk.InputPurpose.URL)
+            self.name.connect("changed", self.on_changed)
+            self.url.connect("changed", self.on_changed)
+            self.url.connect("entry-activated", self.on_save)
+
+            self.browsers = available_browsers()
+            if app_data and app_data["browser"] and app_data["browser"] not in self.browsers:
+                self.browsers.append(app_data["browser"])
+            self.browser = Adw.ComboRow(title=_("Browser"),
+                                        model=Gtk.StringList.new(self.browsers))
+
+            self.icon_row = Adw.ActionRow(title=_("Icon"), subtitle=_("Automatic (favicon)"))
+            self.icon_prev = make_icon(app_data["icon"] if app_data else FALLBACK_ICON)
+            self.icon_row.add_prefix(self.icon_prev)
+            pick = Gtk.Button(icon_name="document-open-symbolic", valign=Gtk.Align.CENTER,
+                              tooltip_text=_("Choose a file"), css_classes=["flat"])
+            pick.connect("clicked", self.on_pick_icon)
+            reset = Gtk.Button(icon_name="view-refresh-symbolic", valign=Gtk.Align.CENTER,
+                               tooltip_text=_("Fetch the favicon again"), css_classes=["flat"])
+            reset.connect("clicked", self.on_reset_icon)
+            self.icon_row.add_suffix(reset); self.icon_row.add_suffix(pick)
+
+            self.slug_lbl = Gtk.Label(css_classes=["dim-label", "caption"], xalign=0,
+                                      margin_top=8, selectable=True)
+
+            for w in (self.name, self.url, self.browser, self.icon_row):
+                grp.add(w)
+            grp.add(self.slug_lbl)
+            page.add(grp)
+            tv.set_content(page)
+            self.set_child(tv)
+
+            self.keep_icon = False
+            if app_data:
+                self.name.set_text(app_data["name"])
+                self.url.set_text(app_data["url"])
+                if app_data["browser"] in self.browsers:
+                    self.browser.set_selected(self.browsers.index(app_data["browser"]))
+                self.keep_icon = True
+                self.icon_row.set_subtitle(_("Current"))
+            self.on_changed()
+
+        def on_changed(self, *_):
+            slug = slugify(self.name.get_text())
+            ok = bool(slug) and bool(self.url.get_text().strip())
+            self.save_btn.set_sensitive(ok)
+            self.slug_lbl.set_label(_("Command: {}").format(f"gtk-launch {PREFIX}{slug}") if slug else "")
+
+        def on_pick_icon(self, *_):
+            fd = Gtk.FileDialog(title=_("Choose an icon"))
+            f = Gtk.FileFilter(name=_("Images"))
+            for m in ("image/png", "image/svg+xml", "image/jpeg", "image/x-icon", "image/webp"):
+                f.add_mime_type(m)
+            store = Gio.ListStore.new(Gtk.FileFilter); store.append(f)
+            fd.set_filters(store)
+
+            def done(dlg, res):
+                try:
+                    file = dlg.open_finish(res)
+                except GLib.Error:
+                    return
+                self.icon_path = file.get_path()
+                self.keep_icon = False
+                self.icon_prev.set_from_file(self.icon_path)
+                self.icon_row.set_subtitle(os.path.basename(self.icon_path))
+            fd.open(self.win, None, done)
+
+        def on_reset_icon(self, *_):
+            self.icon_path = None
+            self.keep_icon = False
+            self.icon_prev.set_from_icon_name(FALLBACK_ICON)
+            self.icon_row.set_subtitle(_("Automatic (favicon)"))
+
+        def on_save(self, *_):
+            if not self.save_btn.get_sensitive():
+                return
+            name = self.name.get_text()
+            url = self.url.get_text()
+            browser = self.browsers[self.browser.get_selected()]
+            icon = self.icon_path
+            if self.keep_icon and self.old:
+                icon = self.old["icon"]
+            old_slug = self.old["slug"] if self.old else None
+            self.save_btn.set_sensitive(False)
+            self.save_btn.set_label(_("Saving…"))
+
+            def work():
+                try:
+                    write_webapp(name, url, browser, icon, old_slug=old_slug)
+                    GLib.idle_add(finish, None)
+                except Exception as e:
+                    GLib.idle_add(finish, str(e))
+
+            def finish(err):
+                if err:
+                    self.save_btn.set_sensitive(True)
+                    self.save_btn.set_label(_("Save") if self.old else _("Add"))
+                    self.win.toast(_("Error: {}").format(err))
+                else:
+                    self.close()
+                    self.win.refresh()
+                    self.win.toast(_("“{}” saved").format(name.strip()))
+                return False
+            threading.Thread(target=work, daemon=True).start()
+
+    class Window(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title=_("Web Apps"),
+                             default_width=560, default_height=620)
+            self.toasts = Adw.ToastOverlay()
+            tv = Adw.ToolbarView()
+            hb = Adw.HeaderBar()
+            add = Gtk.Button(icon_name="list-add-symbolic", tooltip_text=_("New web app (Ctrl+N)"))
+            add.connect("clicked", lambda *_: self.open_editor())
+            hb.pack_start(add)
+            self.search = Gtk.SearchEntry(placeholder_text=_("Search…"), hexpand=True)
+            self.search.connect("search-changed", lambda *_: self.refresh())
+            hb.set_title_widget(self.search)
+            tv.add_top_bar(hb)
+
+            self.page = Adw.PreferencesPage()
+            self.group = None
+            self.empty = Adw.StatusPage(icon_name="web-browser-symbolic", title=_("No web apps"),
+                                        description=_("Press + to add the first one."))
+            self.stack = Gtk.Stack()
+            self.stack.add_named(self.page, "list")
+            self.stack.add_named(self.empty, "empty")
+            tv.set_content(self.stack)
+            self.toasts.set_child(tv)
+            self.set_content(self.toasts)
+
+            # Fase de captura: los atajos funcionan aunque el buscador tenga el foco.
+            keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+            keys.connect("key-pressed", self.on_key)
+            self.add_controller(keys)
+            self.refresh()
+            self.set_focus(self.search)  # escribir para filtrar nada más abrir
+
+        def on_key(self, _c, keyval, _code, state):
+            from gi.repository import Gdk
+            if self.get_visible_dialog():
+                return False  # el diálogo abierto gestiona sus propias teclas
+            ctrl = state & Gdk.ModifierType.CONTROL_MASK
+            if keyval == Gdk.KEY_Escape:
+                if self.search.get_text():
+                    self.search.set_text("")
+                else:
+                    self.close()
+                return True
+            if ctrl and keyval in (Gdk.KEY_n, Gdk.KEY_N):
+                self.open_editor(); return True
+            if ctrl and keyval in (Gdk.KEY_f, Gdk.KEY_F):
+                self.search.grab_focus(); return True
+            if ctrl and keyval in (Gdk.KEY_q, Gdk.KEY_w):
+                self.close(); return True
+            return False
+
+        def toast(self, msg):
+            self.toasts.add_toast(Adw.Toast(title=msg, timeout=3))
+
+        def open_editor(self, data=None):
+            EditDialog(self, data).present(self)
+
+        def refresh(self):
+            if self.group:
+                self.page.remove(self.group)
+            apps = list_webapps()
+            q = self.search.get_text().strip().lower()
+            if q:
+                apps = [a for a in apps if q in a["name"].lower() or q in a["url"].lower()
+                        or q in a["slug"]]
+            self.group = Adw.PreferencesGroup(
+                title=(_("1 web app") if len(apps) == 1 else _("{} web apps").format(len(apps))))
+            for a in apps:
+                self.group.add(self.make_row(a))
+            self.page.add(self.group)
+            self.stack.set_visible_child_name("list" if apps or q else "empty")
+
+        def make_row(self, a):
+            row = Adw.ActionRow(title=GLib.markup_escape_text(a["name"]),
+                                subtitle=GLib.markup_escape_text(a["url"]),
+                                subtitle_lines=1, activatable=True,
+                                tooltip_text=f"{PREFIX}{a['slug']} · {a['browser']}")
+            row.add_prefix(make_icon(a["icon"], 44))
+            # Clic en la fila: abre la webapp y cierra el gestor.
+            row.connect("activated", lambda *_: (launch_webapp(a["slug"]), self.close()))
+
+            # Menú «⋮» (y clic derecho): abrir sin cerrar, editar, eliminar.
+            actions = Gio.SimpleActionGroup()
+            for name, cb in (
+                ("open", lambda *_: launch_webapp(a["slug"])),
+                ("edit", lambda *_: self.open_editor(a)),
+                ("delete", lambda *_: self.confirm_delete(a)),
+            ):
+                act = Gio.SimpleAction.new(name, None)
+                act.connect("activate", cb)
+                actions.add_action(act)
+            row.insert_action_group("row", actions)
+
+            menu = Gio.Menu()
+            menu.append(_("Open without closing"), "row.open")
+            menu.append(_("Edit"), "row.edit")
+            danger = Gio.Menu()
+            danger.append(_("Delete"), "row.delete")
+            menu.append_section(None, danger)
+
+            more = Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=menu,
+                                  valign=Gtk.Align.CENTER, tooltip_text=_("More options"),
+                                  css_classes=["flat"])
+            row.add_suffix(more)
+
+            right = Gtk.GestureClick(button=3)
+            right.connect("pressed", lambda *_: more.popup())
+            row.add_controller(right)
+            return row
+
+        def confirm_delete(self, a):
+            d = Adw.AlertDialog(heading=_("Delete “{}”?").format(a['name']),
+                                body=_("{} and its icon will be deleted.").format(f"{PREFIX}{a['slug']}.desktop"))
+            d.add_response("cancel", _("Cancel"))
+            d.add_response("delete", _("Delete"))
+            d.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+            d.set_default_response("cancel")
+
+            def on_resp(_d, resp):
+                if resp == "delete":
+                    remove_webapp(a["slug"])
+                    self.refresh()
+                    self.toast(_("“{}” deleted").format(a['name']))
+            d.connect("response", on_resp)
+            d.present(self)
+
+    class App(Adw.Application):
+        def __init__(self):
+            super().__init__(application_id="io.github.gitgxldf1sh.WebappGui",
+                             flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+        def do_activate(self):
+            win = self.get_active_window() or Window(self)
+            win.present()
+
+    return App().run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        cli(sys.argv[1:])
+    else:
+        sys.exit(gui())
