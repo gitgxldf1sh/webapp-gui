@@ -20,13 +20,14 @@ import shutil
 import subprocess
 import sys
 import threading
+import unicodedata
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 HOME = Path.home()
-APPS_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "applications"
-ICON_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "icons/webapps"
+DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+APPS_DIR, ICON_DIR = DATA / "applications", DATA / "icons/webapps"
 PREFIX = "webapp-"
 FALLBACK_ICON = "web-browser"
 
@@ -129,12 +130,8 @@ def available_browsers():
 
 
 def slugify(name: str) -> str:
-    s = name.strip().lower()
-    s = re.sub(r"[áàä]", "a", s); s = re.sub(r"[éèë]", "e", s)
-    s = re.sub(r"[íìï]", "i", s); s = re.sub(r"[óòö]", "o", s)
-    s = re.sub(r"[úùü]", "u", s); s = s.replace("ñ", "n")
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s
+    s = unicodedata.normalize("NFKD", name.strip().lower()).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
 
 
 def normalize_url(url: str) -> str:
@@ -167,7 +164,7 @@ def list_webapps():
     apps = []
     if not APPS_DIR.is_dir():
         return apps
-    for f in sorted(APPS_DIR.glob(f"{PREFIX}*.desktop")):
+    for f in APPS_DIR.glob(f"{PREFIX}*.desktop"):
         cp = configparser.ConfigParser(interpolation=None, strict=False)
         cp.optionxform = str
         try:
@@ -175,18 +172,11 @@ def list_webapps():
             e = cp["Desktop Entry"]
         except Exception:
             continue
-        url = e.get("X-WebApp-URL", "")
-        browser = e.get("X-WebApp-Browser", "")
-        if not url:  # .desktop antiguo: intentar sacar la URL del Exec
-            m = re.search(r"--app=\"?([^\"\s]+)", e.get("Exec", ""))
-            url = m.group(1).replace("%%", "%") if m else ""
-        if not browser:
-            browser = e.get("Exec", "").split(" ")[0].strip('"')
         apps.append({
             "slug": f.stem[len(PREFIX):],
             "name": e.get("Name", f.stem),
-            "url": url,
-            "browser": browser,
+            "url": e.get("X-WebApp-URL", ""),
+            "browser": e.get("X-WebApp-Browser", ""),
             "icon": e.get("Icon", FALLBACK_ICON),
             "path": f,
         })
@@ -216,12 +206,11 @@ def _page_icon_links(url: str):
     for tag in re.findall(r"<link\b[^>]*>", html, re.I):
         rel = re.search(r'rel=["\']?([^"\'>]+)', tag, re.I)
         href = re.search(r'href=["\']?([^"\'\s>]+)', tag, re.I)
-        if not rel or not href or "icon" not in rel.group(1).lower():
-            continue
-        if "mask-icon" in rel.group(1).lower():
+        rel = rel.group(1).lower() if rel else ""
+        if not href or "icon" not in rel or "mask-icon" in rel:
             continue
         sizes = re.search(r'sizes=["\']?(\d+)', tag, re.I)
-        size = int(sizes.group(1)) if sizes else (180 if "apple" in rel.group(1) else 32)
+        size = int(sizes.group(1)) if sizes else (180 if "apple" in rel else 32)
         if href.group(1).lower().endswith(".svg"):
             size = 512
         found.append((size, urllib.parse.urljoin(final, href.group(1))))
@@ -404,7 +393,7 @@ def gui():
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Adw", "1")
-    from gi.repository import Adw, Gio, GLib, Gtk
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
     def make_icon(icon: str, size=32):
         img = Gtk.Image(pixel_size=size)
@@ -420,13 +409,15 @@ def gui():
                              content_width=460)
             self.win = win
             self.old = app_data
-            self.icon_path = None
+            # Icono a guardar: ruta/nombre, o None para descargar el favicon.
+            self.icon = app_data["icon"] if app_data else None
+            self.save_label = _("Save") if app_data else _("Add")
 
             tv = Adw.ToolbarView()
             hb = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
             cancel = Gtk.Button(label=_("Cancel"))
             cancel.connect("clicked", lambda *_: self.close())
-            self.save_btn = Gtk.Button(label=_("Save") if app_data else _("Add"),
+            self.save_btn = Gtk.Button(label=self.save_label,
                                        css_classes=["suggested-action"])
             self.save_btn.connect("clicked", self.on_save)
             hb.pack_start(cancel); hb.pack_end(self.save_btn)
@@ -467,13 +458,11 @@ def gui():
             tv.set_content(page)
             self.set_child(tv)
 
-            self.keep_icon = False
             if app_data:
                 self.name.set_text(app_data["name"])
                 self.url.set_text(app_data["url"])
                 if app_data["browser"] in self.browsers:
                     self.browser.set_selected(self.browsers.index(app_data["browser"]))
-                self.keep_icon = True
                 self.icon_row.set_subtitle(_("Current"))
             self.on_changed()
 
@@ -496,15 +485,13 @@ def gui():
                     file = dlg.open_finish(res)
                 except GLib.Error:
                     return
-                self.icon_path = file.get_path()
-                self.keep_icon = False
-                self.icon_prev.set_from_file(self.icon_path)
-                self.icon_row.set_subtitle(os.path.basename(self.icon_path))
+                self.icon = file.get_path()
+                self.icon_prev.set_from_file(self.icon)
+                self.icon_row.set_subtitle(os.path.basename(self.icon))
             fd.open(self.win, None, done)
 
         def on_reset_icon(self, *_):
-            self.icon_path = None
-            self.keep_icon = False
+            self.icon = None
             self.icon_prev.set_from_icon_name(FALLBACK_ICON)
             self.icon_row.set_subtitle(_("Automatic (favicon)"))
 
@@ -514,9 +501,7 @@ def gui():
             name = self.name.get_text()
             url = self.url.get_text()
             browser = self.browsers[self.browser.get_selected()]
-            icon = self.icon_path
-            if self.keep_icon and self.old:
-                icon = self.old["icon"]
+            icon = self.icon
             old_slug = self.old["slug"] if self.old else None
             self.save_btn.set_sensitive(False)
             self.save_btn.set_label(_("Saving…"))
@@ -531,7 +516,7 @@ def gui():
             def finish(err):
                 if err:
                     self.save_btn.set_sensitive(True)
-                    self.save_btn.set_label(_("Save") if self.old else _("Add"))
+                    self.save_btn.set_label(self.save_label)
                     self.win.toast(_("Error: {}").format(err))
                 else:
                     self.close()
@@ -574,21 +559,21 @@ def gui():
             self.set_focus(self.search)  # escribir para filtrar nada más abrir
 
         def on_key(self, _c, keyval, _code, state):
-            from gi.repository import Gdk
             if self.get_visible_dialog():
                 return False  # el diálogo abierto gestiona sus propias teclas
             ctrl = state & Gdk.ModifierType.CONTROL_MASK
-            if keyval == Gdk.KEY_Escape:
+            k = Gdk.keyval_to_lower(keyval)  # Bloq Mayús / Mayús no cambian el atajo
+            if k == Gdk.KEY_Escape:
                 if self.search.get_text():
                     self.search.set_text("")
                 else:
                     self.close()
                 return True
-            if ctrl and keyval in (Gdk.KEY_n, Gdk.KEY_N):
+            if ctrl and k == Gdk.KEY_n:
                 self.open_editor(); return True
-            if ctrl and keyval in (Gdk.KEY_f, Gdk.KEY_F):
+            if ctrl and k == Gdk.KEY_f:
                 self.search.grab_focus(); return True
-            if ctrl and keyval in (Gdk.KEY_q, Gdk.KEY_w):
+            if ctrl and k in (Gdk.KEY_q, Gdk.KEY_w):
                 self.close(); return True
             return False
 
@@ -614,10 +599,10 @@ def gui():
             self.stack.set_visible_child_name("list" if apps or q else "empty")
 
         def make_row(self, a):
-            row = Adw.ActionRow(title=GLib.markup_escape_text(a["name"]),
-                                subtitle=GLib.markup_escape_text(a["url"]),
-                                subtitle_lines=1, activatable=True,
+            row = Adw.ActionRow(use_markup=False, subtitle_lines=1, activatable=True,
                                 tooltip_text=f"{PREFIX}{a['slug']} · {a['browser']}")
+            # Texto plano: se asigna después de desactivar el markup.
+            row.set_title(a["name"]); row.set_subtitle(a["url"])
             row.add_prefix(make_icon(a["icon"], 44))
             # Clic en la fila: abre la webapp y cierra el gestor.
             row.connect("activated", lambda *_: (launch_webapp(a["slug"]), self.close()))
