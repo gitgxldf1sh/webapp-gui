@@ -466,13 +466,13 @@ def gui():
                 self.icon_row.set_subtitle(_("Current"))
             self.on_changed()
 
-        def on_changed(self, *_):
+        def on_changed(self, *_args):
             slug = slugify(self.name.get_text())
             ok = bool(slug) and bool(self.url.get_text().strip())
             self.save_btn.set_sensitive(ok)
             self.slug_lbl.set_label(_("Command: {}").format(f"gtk-launch {PREFIX}{slug}") if slug else "")
 
-        def on_pick_icon(self, *_):
+        def on_pick_icon(self, *_args):
             fd = Gtk.FileDialog(title=_("Choose an icon"))
             f = Gtk.FileFilter(name=_("Images"))
             for m in ("image/png", "image/svg+xml", "image/jpeg", "image/x-icon", "image/webp"):
@@ -490,12 +490,12 @@ def gui():
                 self.icon_row.set_subtitle(os.path.basename(self.icon))
             fd.open(self.win, None, done)
 
-        def on_reset_icon(self, *_):
+        def on_reset_icon(self, *_args):
             self.icon = None
             self.icon_prev.set_from_icon_name(FALLBACK_ICON)
             self.icon_row.set_subtitle(_("Automatic (favicon)"))
 
-        def on_save(self, *_):
+        def on_save(self, *_args):
             if not self.save_btn.get_sensitive():
                 return
             name = self.name.get_text()
