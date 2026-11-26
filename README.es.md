@@ -121,8 +121,10 @@ exacta depende de tu versión):
 ```ini
 windowrule = float, class:^(io\.github\.gitgxldf1sh\.WebappGui)$
 windowrule = center, class:^(io\.github\.gitgxldf1sh\.WebappGui)$
-windowrule = size 560 640, class:^(io\.github\.gitgxldf1sh\.WebappGui)$
 ```
+
+No hace falta fijar un tamaño: la ventana se ajusta a la lista y crece hasta
+640 px de alto; a partir de ahí, la lista tiene scroll.
 
 ## Licencia
 

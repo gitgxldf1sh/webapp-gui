@@ -29,6 +29,7 @@ HOME = Path.home()
 DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
 APPS_DIR, ICON_DIR = DATA / "applications", DATA / "icons/webapps"
 PREFIX = "webapp-"
+MAX_HEIGHT = 640  # alto máximo de la ventana; con más webapps aparece el scroll
 FALLBACK_ICON = "web-browser"
 
 
@@ -527,8 +528,9 @@ def gui():
 
     class Window(Adw.ApplicationWindow):
         def __init__(self, app):
-            super().__init__(application=app, title=_("Web Apps"),
-                             default_width=560, default_height=620)
+            # Sin altura fija: la ventana se ajusta a la lista hasta MAX_HEIGHT y
+            # a partir de ahí aparece la barra de scroll.
+            super().__init__(application=app, title=_("Web Apps"), default_width=560)
             self.toasts = Adw.ToastOverlay()
             tv = Adw.ToolbarView()
             hb = Adw.HeaderBar()
@@ -540,16 +542,25 @@ def gui():
             hb.set_title_widget(self.search)
             tv.add_top_bar(hb)
 
-            self.page = Adw.PreferencesPage()
+            # Como Adw.PreferencesPage, pero el scroll propaga su altura natural
+            # para que la ventana no sea más alta que la lista.
+            self.page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_top=24,
+                                margin_bottom=24, margin_start=12, margin_end=12)
+            self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                             propagate_natural_height=True,
+                                             child=Adw.Clamp(child=self.page))
             self.group = None
             self.empty = Adw.StatusPage(icon_name="web-browser-symbolic", title=_("No web apps"),
                                         description=_("Press + to add the first one."))
-            self.stack = Gtk.Stack()
-            self.stack.add_named(self.page, "list")
+            self.stack = Gtk.Stack(vhomogeneous=False)
+            self.stack.add_named(self.scroll, "list")
             self.stack.add_named(self.empty, "empty")
             tv.set_content(self.stack)
             self.toasts.set_child(tv)
             self.set_content(self.toasts)
+            # Altura máxima de la lista = MAX_HEIGHT menos la barra de título.
+            header_h = hb.measure(Gtk.Orientation.VERTICAL, -1)[1]
+            self.scroll.set_max_content_height(MAX_HEIGHT - header_h)
 
             # Fase de captura: los atajos funcionan aunque el buscador tenga el foco.
             keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
@@ -595,7 +606,7 @@ def gui():
                 title=(_("1 web app") if len(apps) == 1 else _("{} web apps").format(len(apps))))
             for a in apps:
                 self.group.add(self.make_row(a))
-            self.page.add(self.group)
+            self.page.append(self.group)
             self.stack.set_visible_child_name("list" if apps or q else "empty")
 
         def make_row(self, a):

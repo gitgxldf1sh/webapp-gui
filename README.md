@@ -117,8 +117,10 @@ example, in Hyprland (the exact syntax depends on your Hyprland version):
 ```ini
 windowrule = float, class:^(io\.github\.gitgxldf1sh\.WebappGui)$
 windowrule = center, class:^(io\.github\.gitgxldf1sh\.WebappGui)$
-windowrule = size 560 640, class:^(io\.github\.gitgxldf1sh\.WebappGui)$
 ```
+
+Don't set a fixed size: the window already fits its list and grows up to
+640 px tall, then the list scrolls.
 
 ## License
 
